@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -36,6 +37,11 @@ type Config struct {
 	Subscriptions []Subscription `json:"subscriptions"`
 }
 
+type QueuedMessage struct {
+	WebhookUrl string
+	Content    DiscordWebhookMessage
+}
+
 type DiscordWebhookMessage struct {
 	Content string `json:"content"`
 }
@@ -56,7 +62,6 @@ func (msg DiscordWebhookMessage) serialize() []byte {
 
 var connectHandler mqtt.OnConnectHandler = func(client mqtt.Client) {
 	fmt.Println("connectHandler Connected")
-	publishDiscordWebhook(config.Server.Webhook, "meta", "*connected*")
 }
 
 var connectLostHandler mqtt.ConnectionLostHandler = func(client mqtt.Client, err error) {
@@ -67,28 +72,14 @@ var messagePubHandler mqtt.MessageHandler = func(client mqtt.Client, msg mqtt.Me
 	fmt.Printf("INFO: Default message handler received message: %s from topic: %s\n", msg.Payload(), msg.Topic())
 }
 
-func publishDiscordWebhook(url string, topic string, payload string) {
-
-	msg := NewDiscordWebhookMessage(topic, payload)
-	client := &http.Client{}
-	req, err := http.NewRequest("POST", url, bytes.NewReader(msg.serialize()))
-	if err != nil {
-		log.Fatal(err)
+func callbackSub(sub Subscription, messages chan<- QueuedMessage) func(client mqtt.Client, msg mqtt.Message) {
+	return func(client mqtt.Client, msg mqtt.Message) {
+		webhook := sub.Webhook
+		messages <- QueuedMessage{
+			webhook,
+			NewDiscordWebhookMessage(msg.Topic(), string(msg.Payload())),
+		}
 	}
-
-	req.Header.Add("Content-Type", "application/json")
-
-	resp, err := client.Do(req)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	if resp.StatusCode == 204 {
-	} else {
-		log.Fatalf("%s (%d): \n\nPOSTdata was: %s", url, resp.StatusCode, msg.serialize())
-	}
-
-	defer resp.Body.Close()
 }
 
 func main() {
@@ -130,17 +121,63 @@ func main() {
 		panic(token.Error())
 	}
 
+	messages := make(chan QueuedMessage, 64)
+
+	go func(queue <-chan QueuedMessage) {
+
+		client := &http.Client{}
+
+		for msg := range queue {
+			for {
+				req, err := http.NewRequest("POST", msg.WebhookUrl, bytes.NewReader(msg.Content.serialize()))
+				if err != nil {
+					log.Fatal(err)
+				}
+
+				req.Header.Add("Content-Type", "application/json")
+
+				resp, err := client.Do(req)
+				defer resp.Body.Close()
+
+				if err != nil {
+					log.Fatal(err)
+				}
+
+				if resp.StatusCode == 204 {
+					break
+				} else if resp.StatusCode == 429 {
+					resetafter, err := strconv.ParseFloat(resp.Header.Get("X-RateLimit-Reset-After"), 32)
+					if err != nil {
+						resetafter = 2.0
+					}
+					if resetafter == 0.0 {
+						resetafter = 3.0
+					}
+					sleepfor := time.Duration(resetafter) * time.Second
+					log.Printf("%s (%d): sleeping for %s", msg.WebhookUrl, resp.StatusCode, sleepfor)
+					time.Sleep(sleepfor)
+				} else {
+					log.Fatalf("%s (%d): \n\nPOSTdata was: %s", msg.WebhookUrl, resp.StatusCode, msg.Content.serialize())
+				}
+			}
+		}
+	}(messages)
+
 	for i := range config.Subscriptions {
 		fmt.Printf("Subscribing to topic: %s\n", config.Subscriptions[i].Topic)
-		token := client.Subscribe(config.Subscriptions[i].Topic, 1, func(client mqtt.Client, msg mqtt.Message) {
-			go publishDiscordWebhook(config.Subscriptions[i].Webhook, msg.Topic(), string(msg.Payload()))
-		})
+		token := client.Subscribe(config.Subscriptions[i].Topic, 1, callbackSub(config.Subscriptions[i], messages))
 		token.Wait()
 	}
 
 	<-done
 	fmt.Println("SIGINT/SIGTERM received, exiting")
-	publishDiscordWebhook(config.Server.Webhook, "meta", "*SIGINT/SIGTERM*")
+
+	messages <- QueuedMessage{
+		config.Server.Webhook,
+		NewDiscordWebhookMessage("meta", "SIGINT/SIGTERM"),
+	}
+	close(messages)
+
 	client.Disconnect(500)
 	fmt.Println("Finished")
 }
