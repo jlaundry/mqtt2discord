@@ -93,7 +93,7 @@ func main() {
 		done <- true
 	}()
 
-	jsonFile, err := os.Open("config.json")
+	jsonFile, err := os.Open("mqtt2discord.json")
 	if err != nil {
 		panic(err)
 	}
