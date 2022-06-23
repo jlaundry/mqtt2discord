@@ -16,24 +16,22 @@ import (
 	mqtt "github.com/eclipse/paho.mqtt.golang"
 )
 
-const (
-	mqtt_client_id = "mqtt2discord"
-)
-
 type Subscription struct {
 	Webhook string `json:"webhook"`
 	Topic   string `json:"topic"`
 }
 
-type Server struct {
+type MQTTServer struct {
 	Address  string `json:"address"`
 	Username string `json:"username"`
 	Password string `json:"password"`
+	Prefix   string `json:"prefix"`
+	ClientID string `json:"client_id"`
 	Webhook  string `json:"meta_webhook"`
 }
 
 type Config struct {
-	Server        Server         `json:"mqtt_server"`
+	MQTT          MQTTServer     `json:"mqtt_server"`
 	Subscriptions []Subscription `json:"subscriptions"`
 }
 
@@ -58,18 +56,6 @@ func NewDiscordWebhookMessage(topic string, payload string) DiscordWebhookMessag
 func (msg DiscordWebhookMessage) serialize() []byte {
 	jsonMsg, _ := json.Marshal(msg)
 	return []byte(jsonMsg)
-}
-
-var connectHandler mqtt.OnConnectHandler = func(client mqtt.Client) {
-	fmt.Println("connectHandler Connected")
-}
-
-var connectLostHandler mqtt.ConnectionLostHandler = func(client mqtt.Client, err error) {
-	log.Fatalf("connectLostHandler Connect lost: %v", err)
-}
-
-var messagePubHandler mqtt.MessageHandler = func(client mqtt.Client, msg mqtt.Message) {
-	fmt.Printf("INFO: Default message handler received message: %s from topic: %s\n", msg.Payload(), msg.Topic())
 }
 
 func callbackSub(sub Subscription, messages chan<- QueuedMessage) func(client mqtt.Client, msg mqtt.Message) {
@@ -107,19 +93,44 @@ func main() {
 	fmt.Println(config)
 
 	opts := mqtt.NewClientOptions()
-	opts.AddBroker(config.Server.Address)
-	opts.SetClientID(mqtt_client_id)
-	// opts.SetUsername("emqx")
-	// opts.SetPassword("public")
-	opts.SetDefaultPublishHandler(messagePubHandler)
-	opts.OnConnect = connectHandler
-	opts.OnConnectionLost = connectLostHandler
+	opts.AddBroker(config.MQTT.Address)
+
+	//TODO: append / to prefix if not already
+	if config.MQTT.Prefix == "" {
+		config.MQTT.Prefix = "mqtt2discord/"
+	}
+
+	if config.MQTT.ClientID != "" {
+		opts.SetClientID(config.MQTT.ClientID)
+	} else {
+		opts.SetClientID("mqtt2discord")
+	}
+
+	if config.MQTT.Username != "" {
+		opts.SetUsername(config.MQTT.Username)
+		opts.SetPassword(config.MQTT.Password)
+	}
+
+	opts.SetDefaultPublishHandler(func(c mqtt.Client, m mqtt.Message) {
+		log.Printf("WARN received unsolicited MQTT message on %s: %s\n", m.Topic(), m.Payload())
+	})
+	opts.OnConnect = func(c mqtt.Client) {
+		log.Println("MQTT connected")
+	}
+	opts.OnConnectionLost = func(c mqtt.Client, err error) {
+		log.Fatalf("MQTT connectionLost: %e", err)
+	}
 
 	client := mqtt.NewClient(opts)
-	fmt.Printf("Connecting to %s\n", config.Server.Address)
+	fmt.Printf("Connecting to %s\n", config.MQTT.Address)
 	if token := client.Connect(); token.Wait() && token.Error() != nil {
-		panic(token.Error())
+		log.Fatal(token.Error())
 	}
+	fmt.Println("Connected")
+	client.Publish(fmt.Sprintf("%sstatus", config.MQTT.Prefix), 0, false, "online")
+
+	defer client.Disconnect(2000)
+	defer log.Println("Disconnecting MQTT")
 
 	messages := make(chan QueuedMessage, 64)
 
@@ -173,11 +184,8 @@ func main() {
 	fmt.Println("SIGINT/SIGTERM received, exiting")
 
 	messages <- QueuedMessage{
-		config.Server.Webhook,
+		config.MQTT.Webhook,
 		NewDiscordWebhookMessage("meta", "SIGINT/SIGTERM"),
 	}
 	close(messages)
-
-	client.Disconnect(500)
-	fmt.Println("Finished")
 }
