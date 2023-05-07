@@ -1,5 +1,7 @@
 # mqtt2discord
 
+⚠️♻️ **Deprecated**, go see https://github.com/jlaundry/qtbot where (most of) the code lives on.
+
 A simple Go app that connects to a MQTT server, subscribes to various topics, and pushes those messages into a Discord webhook.
 
 ## Usage
